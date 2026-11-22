@@ -1,0 +1,587 @@
+openapi: 3.1.0
+info:
+  title: Абзац — прикладной уровень HTTP и SSE
+  version: 1.0.0
+  description: |-
+    LLM, вариант 5. Пользователь вводит имя, открывает SSE и отправляет текст из 5–10 абзацев. Входящее описание передаётся транспорту через POST /send, результаты приходят от транспорта через POST /receive и доставляются в SSE-поток только сессии, создавшей request_id. Имена пользователей не являются уникальными. История хранится в памяти текущей сессии; при обновлении страницы или выходе очищается. Файл .txt браузер читает локально как UTF-8 и отправляет текст через POST /api/send.
+
+    Порядок проверки: POST /api/sessions → GET /api/events (EventSource) → POST /api/send → события review. При error=true текст комментария не отображается. Для просмотра SSE по мере поступления используйте EventSource или curl -N; обычная кнопка Execute в Swagger UI может ждать завершения потока.
+
+    Служебные адреса: / — интерфейс приложения, /api-docs/ — Swagger UI, /openapi.json — данная спецификация. Отсутствуют отдельные HTTP-маршруты для UI-компонентов, локального чтения файла и внутренних функций. JSON-тело ограничено 128 КБ. Запросы POST/DELETE к /api с Sec-Fetch-Site: cross-site отклоняются (403).
+paths:
+  /api/sessions:
+    post:
+      tags:
+      - Сессии
+      summary: Ввести имя и создать сессию
+      description: Удаляет предыдущую сессию этого браузера, создаёт новую и устанавливает HttpOnly-cookie abzac_session
+        с Path=/api и SameSite=Strict. Крайние пробелы имени удаляются. Число сессий ограничено 100. Имя не является
+        паролем или доказательством личности.
+      operationId: application_api_sessions_post
+      security: []
+      responses:
+        '201':
+          description: Сессия создана; тело содержит нормализованное имя.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Login'
+              example:
+                username: Анна
+          headers:
+            Set-Cookie:
+              description: Сессионный идентификатор UUID; HttpOnly; SameSite=Strict; Path=/api. Флаг Secure зависит
+                от COOKIE_SECURE.
+              schema:
+                type: string
+              example: abzac_session=03a4656d-d46b-4ff4-898c-580195cfa8d2; Path=/api; HttpOnly; SameSite=Strict
+        '400':
+          description: Введите имя от 1 до 40 символов без перевода строки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Введите имя от 1 до 40 символов без перевода строки
+        '403':
+          description: Межсайтовый запрос запрещён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Межсайтовый запрос запрещён
+        '413':
+          description: Неверное тело HTTP-запроса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Неверное тело HTTP-запроса
+        '503':
+          description: Достигнут лимит сессий
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Достигнут лимит сессий
+      requestBody:
+        required: true
+        description: JSON-объект. Неизвестные поля запрещены.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Login'
+            example:
+              username: Анна
+  /api/sessions/current:
+    delete:
+      tags:
+      - Сессии
+      summary: Выйти и закрыть SSE
+      description: Удаляет текущую сессию, закрывает все её SSE-потоки, удаляет связанные запросы и очищает cookie.
+        Возвращает пустое тело.
+      operationId: application_api_sessions_current_delete
+      security:
+      - SessionCookie: []
+      responses:
+        '204':
+          description: Сессия удалена, тело отсутствует.
+        '401':
+          description: Войдите в приложение
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Войдите в приложение
+        '403':
+          description: Межсайтовый запрос запрещён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Межсайтовый запрос запрещён
+  /api/send:
+    post:
+      tags:
+      - Отзывы
+      summary: Отправить описание на анализ
+      description: Требуется сессия и хотя бы одно открытое SSE-соединение этой сессии. Сервер создаёт UUID и время,
+        вычисляет число абзацев и отправляет полное сообщение в POST /send транспорта. Одновременно допускается
+        до трёх незавершённых описаний одной сессии. HTTP 202 содержит исходное сообщение с метаданными; комментарии
+        придут отдельно через SSE.
+      operationId: application_api_send_post
+      security:
+      - SessionCookie: []
+      responses:
+        '202':
+          description: Запрос передан транспорту. Сохраните request_id для сопоставления событий.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DescriptionMessage'
+              example:
+                request_id: 958394fa-c574-4914-934b-42c468595034
+                username: Анна
+                send_time: '2026-11-22T12:00:00.000Z'
+                paragraphs_count: 5
+                description: |-
+                  Мы разрабатываем сервис обмена книгами между жителями одного района.
+
+                  Пользователь размещает книгу и находит интересующее издание поблизости.
+
+                  Основная аудитория — студенты и молодые семьи, желающие обмениваться книгами.
+
+                  Встречу для передачи книги участники согласуют самостоятельно.
+
+                  Успех сервиса оценивается количеством завершённых обменов и отзывами участников.
+        '400':
+          description: Нужно от 5 до 10 абзацев, не более 30 000 символов
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Нужно от 5 до 10 абзацев, не более 30 000 символов
+        '401':
+          description: Войдите в приложение
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Войдите в приложение
+        '403':
+          description: Межсайтовый запрос запрещён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Межсайтовый запрос запрещён
+        '409':
+          description: Дождитесь подключения к потоку событий
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Дождитесь подключения к потоку событий
+        '413':
+          description: Неверное тело HTTP-запроса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Неверное тело HTTP-запроса
+        '429':
+          description: Дождитесь завершения предыдущих описаний
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Дождитесь завершения предыдущих описаний
+        '502':
+          description: Не удалось передать описание. Проверьте доступность транспорта и агента
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Не удалось передать описание. Проверьте доступность транспорта и агента
+      requestBody:
+        required: true
+        description: JSON-объект. Неизвестные поля запрещены.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Input'
+            example:
+              description: |-
+                Мы разрабатываем сервис обмена книгами между жителями одного района.
+
+                Пользователь размещает книгу и находит интересующее издание поблизости.
+
+                Основная аудитория — студенты и молодые семьи, желающие обмениваться книгами.
+
+                Встречу для передачи книги участники согласуют самостоятельно.
+
+                Успех сервиса оценивается количеством завершённых обменов и отзывами участников.
+  /receive:
+    post:
+      tags:
+      - Отзывы
+      summary: Принять комментарий от транспорта
+      description: Внутренний callback после сборки одного комментария. Проверяет метаданные исходного запроса и
+        маршрутизирует результат по request_id в соответствующую сессию, а не по имени. Первый результат абзаца
+        создаёт SSE-событие review; повтор возвращает duplicate. Если сессия закрыта или запрос потерян при перезапуске,
+        возвращает ignored. Ошибочный комментарий должен иметь пустой comment и заполненный error_code.
+      operationId: application_receive_post
+      security:
+      - InternalKey: []
+      responses:
+        '200':
+          description: Комментарий обработан либо подтверждён без повторного события.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+              examples:
+                accepted:
+                  summary: SSE-событие создано
+                  value:
+                    status: ok
+                duplicate:
+                  summary: Результат абзаца уже получен
+                  value:
+                    status: duplicate
+                ignored:
+                  summary: Запрос или сессия отсутствуют
+                  value:
+                    status: ignored
+        '400':
+          description: Неверная структура результата
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Неверная структура результата
+        '401':
+          description: Неверный межсервисный ключ
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Неверный межсервисный ключ
+        '409':
+          description: Метаданные не совпадают с исходным запросом
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Метаданные не совпадают с исходным запросом
+        '413':
+          description: Неверное тело HTTP-запроса
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Неверное тело HTTP-запроса
+      requestBody:
+        required: true
+        description: JSON-объект. Неизвестные поля запрещены.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Review'
+            examples:
+              comment:
+                summary: Успешный комментарий
+                value:
+                  request_id: 958394fa-c574-4914-934b-42c468595034
+                  username: Анна
+                  send_time: '2026-11-22T12:00:00.000Z'
+                  paragraphs_count: 5
+                  paragraph_number: 1
+                  comment: 'Назначение сервиса понятно. Уточните, как определяется район поиска: это сделает описание
+                    условий обмена однозначным.'
+                  error: false
+                  error_code: null
+              loss:
+                summary: Потеря сегментов
+                value:
+                  request_id: 958394fa-c574-4914-934b-42c468595034
+                  username: Анна
+                  send_time: '2026-11-22T12:00:00.000Z'
+                  paragraphs_count: 5
+                  paragraph_number: 1
+                  comment: ''
+                  error: true
+                  error_code: segment_loss
+  /api/events:
+    get:
+      tags:
+      - SSE
+      summary: Получать комментарии через SSE
+      description: Длительное соединение text/event-stream. Сначала connected с data={}, затем review с полным объектом
+        Review для каждого абзаца. У review есть последовательный id в пределах сессии. Last-Event-ID позволяет
+        повторить сохранившиеся события с большим id (буфер до 200 событий). Heartbeat — комментарий SSE каждые
+        15 секунд, retry=1500 мс. Ошибки комментария передаются как review с error=true, отдельного события error
+        нет. При выходе поток закрывается.
+      operationId: application_api_events_get
+      security:
+      - SessionCookie: []
+      responses:
+        '200':
+          description: Поток остаётся открытым до выхода, закрытия соединения или завершения сервера.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+              example: no-cache, no-transform
+            Connection:
+              schema:
+                type: string
+              example: keep-alive
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: Текст SSE; data события review соответствует схеме Review.
+              example: |+
+                retry: 1500
+                event: connected
+                data: {}
+
+                id: 1
+                event: review
+                data: {"request_id": "958394fa-c574-4914-934b-42c468595034", "username": "Анна", "send_time": "2026-11-22T12:00:00.000Z", "paragraphs_count": 5, "paragraph_number": 1, "comment": "Назначение сервиса понятно. Уточните, как определяется район поиска: это сделает описание условий обмена однозначным.", "error": false, "error_code": null}
+
+                : heartbeat
+
+        '401':
+          description: Войдите в приложение
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                detail: Войдите в приложение
+      parameters:
+      - in: header
+        name: Last-Event-ID
+        required: false
+        description: Последний обработанный id review в текущей сессии; при первом подключении не передаётся.
+        schema:
+          type: integer
+          minimum: 0
+        example: 1
+  /health:
+    get:
+      tags:
+      - Состояние
+      summary: Проверить прикладной сервер
+      description: Проверяет HTTP-процесс и сообщает протокол SSE. Не обращается к транспорту, Kafka или Ollama.
+      operationId: application_health_get
+      security: []
+      responses:
+        '200':
+          description: Прикладной HTTP-сервер готов.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplicationHealth'
+              example:
+                status: ok
+                protocol: SSE
+components:
+  schemas:
+    DescriptionMessage:
+      additionalProperties: false
+      properties:
+        request_id:
+          description: UUID запроса, одинаковый на трёх уровнях
+          format: uuid
+          title: Request Id
+          type: string
+        username:
+          description: Имя отправителя
+          maxLength: 40
+          minLength: 1
+          pattern: ^\S(?:[^\r\n]*\S)?$
+          title: Username
+          type: string
+        send_time:
+          description: Время отправки исходного описания с часовым поясом
+          format: date-time
+          title: Send Time
+          type: string
+        paragraphs_count:
+          description: Число абзацев исходного описания
+          maximum: 10
+          minimum: 5
+          title: Paragraphs Count
+          type: integer
+        description:
+          description: Описание из 5–10 абзацев, разделённых пустой строкой
+          maxLength: 30000
+          minLength: 1
+          title: Description
+          type: string
+      required:
+      - request_id
+      - username
+      - send_time
+      - paragraphs_count
+      - description
+      title: DescriptionMessage
+      type: object
+      description: Описание из 5–10 непустых абзацев. Разделитель — пустая строка; CRLF нормализуется в LF. paragraphs_count
+        должен совпадать с фактическим числом абзацев. send_time содержит часовой пояс.
+    Review:
+      additionalProperties: false
+      properties:
+        request_id:
+          description: UUID запроса, одинаковый на трёх уровнях
+          format: uuid
+          title: Request Id
+          type: string
+        username:
+          description: Имя отправителя
+          maxLength: 40
+          minLength: 1
+          pattern: ^\S(?:[^\r\n]*\S)?$
+          title: Username
+          type: string
+        send_time:
+          description: Время отправки исходного описания с часовым поясом
+          format: date-time
+          title: Send Time
+          type: string
+        paragraphs_count:
+          description: Число абзацев исходного описания
+          maximum: 10
+          minimum: 5
+          title: Paragraphs Count
+          type: integer
+        paragraph_number:
+          description: Номер исходного абзаца
+          maximum: 10
+          minimum: 1
+          title: Paragraph Number
+          type: integer
+        comment:
+          description: Собранный комментарий; пустая строка при ошибке
+          maxLength: 1000000
+          title: Comment
+          type: string
+        error:
+          description: Ошибка доставки или генерации
+          title: Error
+          type: boolean
+        error_code:
+          anyOf:
+          - enum:
+            - segment_loss
+            - integrity
+            - generation
+            type: string
+          - type: 'null'
+          default: null
+          description: Причина ошибки
+          title: Error Code
+      required:
+      - request_id
+      - username
+      - send_time
+      - paragraphs_count
+      - paragraph_number
+      - comment
+      - error
+      title: Review
+      type: object
+      description: Комментарий одного абзаца. paragraph_number ≤ paragraphs_count. При error=false comment непустой,
+        error_code отсутствует либо null; при error=true comment пустой, error_code обязателен.
+    Login:
+      type: object
+      additionalProperties: false
+      required:
+      - username
+      properties:
+        username:
+          type: string
+          minLength: 1
+          maxLength: 40
+          description: Имя после удаления крайних пробелов — от 1 до 40 символов, без переводов строк.
+    Input:
+      type: object
+      additionalProperties: false
+      required:
+      - description
+      properties:
+        description:
+          type: string
+          minLength: 1
+          maxLength: 30000
+          description: Описание из 5–10 непустых абзацев; пустая строка разделяет абзацы. Файл .txt читается браузером
+            и передаётся здесь как обычная строка, multipart-загрузка не используется.
+    StatusResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - status
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+          - duplicate
+          - ignored
+          description: ok — событие обработано; duplicate — повтор абзаца; ignored — сессия/запрос уже отсутствует.
+    ApplicationHealth:
+      type: object
+      additionalProperties: false
+      required:
+      - status
+      - protocol
+      properties:
+        status:
+          type: string
+          enum:
+          - ok
+          description: HTTP-сервер готов.
+        protocol:
+          type: string
+          enum:
+          - SSE
+          description: Протокол доставки результатов браузеру.
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required:
+      - detail
+      properties:
+        detail:
+          type: string
+          description: Пояснение причины ошибки на русском языке.
+  securitySchemes:
+    InternalKey:
+      type: apiKey
+      in: header
+      name: X-Internal-Key
+      description: Общий межсервисный ключ INTERNAL_API_KEY из .env, не менее 16 символов. Для просмотра документации
+        ключ не требуется.
+    SessionCookie:
+      type: apiKey
+      in: cookie
+      name: abzac_session
+      description: HttpOnly-сессия создаётся POST /api/sessions. Браузер отправляет cookie автоматически для /api;
+        SameSite=Strict. В Swagger UI самого приложения сначала выполните вход, вручную задавать HttpOnly-cookie
+        не требуется.
+servers:
+- url: http://localhost:8001
+  description: Локальный запуск, стандартный порт
+- url: http://127.0.0.1:8001
+  description: Локальный адрес IPv4
+externalDocs:
+  description: Учебное задание по сетевым технологиям
+  url: https://github.com/iu5git/Networking
+tags:
+- name: Сессии
+  description: Ввод имени, завершение работы и очистка истории.
+- name: Отзывы
+  description: Отправка описания и приём комментария транспорта.
+- name: SSE
+  description: Доставка результатов браузеру по длительному HTTP-соединению.
+- name: Состояние
+  description: Готовность прикладного сервера.
